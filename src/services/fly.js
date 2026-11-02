@@ -4,10 +4,28 @@ const { assertAuthorized } = require('../access');
 const { brandEmbed } = require('../embeds');
 const { formatDuration, formatTime, MIN } = require('../utils');
 
-const MAX_FAILURES = 3;       
-const MAX_ACTIVE = 10;        
-const MIN_INTERVAL = 2, MAX_INTERVAL = 300;   // seconds
+const MAX_FAILURES = 3;
+const MAX_ACTIVE = 10;
+const MIN_INTERVAL = 0.7, MAX_INTERVAL = 300;
 const VOICE_TYPES = [ChannelType.GuildVoice, ChannelType.GuildStageVoice];
+
+// Discord allows roughly 10 member edits per 10s per server (unofficial figure).
+// We stay just under it so moves are never queued up or rejected.
+const RATE_CAPACITY = 9;
+const RATE_WINDOW_MS = 10000;
+const RATE_RETRY_MS = 250;
+
+function createLimiter(capacity = RATE_CAPACITY, windowMs = RATE_WINDOW_MS) {
+  const stamps = [];
+  return {
+    tryTake(now = Date.now()) {
+      while (stamps.length && now - stamps[0] >= windowMs) stamps.shift();
+      if (stamps.length >= capacity) return false;
+      stamps.push(now);
+      return true;
+    },
+  };
+}
 
 function nextTarget(channelIds, startIdx, currentChannelId) {
   const n = channelIds.length;
@@ -20,6 +38,7 @@ function nextTarget(channelIds, startIdx, currentChannelId) {
 
 function createFlyService({ db, client, log }) {
   let sweeping = false;
+  const limiter = createLimiter();
 
   async function checkChannel(guild, me, id) {
     const ch = await guild.channels.fetch(id).catch(() => null);
@@ -48,7 +67,7 @@ function createFlyService({ db, client, log }) {
     const e = brandEmbed(title).addFields(
       { name: 'Member', value: `<@${fly.user_id}>`, inline: true },
       { name: 'Started by', value: `<@${fly.moderator_id}>`, inline: true },
-      { name: 'Every', value: `${Math.round(fly.interval_ms / 1000)}s`, inline: true },
+      { name: 'Every', value: `${fly.interval_ms / 1000}s`, inline: true },
       { name: 'Channels', value: JSON.parse(fly.channels).map((c) => `<#${c}>`).join(' → ') },
       { name: 'Moves so far', value: String(fly.moves), inline: true },
       { name: active ? 'Ends' : 'Result', value: active ? `${formatTime(fly.expires_at, tz)} (<t:${Math.floor(fly.expires_at / 1000)}:R>)` : fly.status, inline: true },
@@ -65,7 +84,7 @@ function createFlyService({ db, client, log }) {
     durationMs ??= s.default_duration_ms;
     intervalSec ??= s.default_interval_seconds;
     if (durationMs < MIN || durationMs > s.max_duration_ms) throw new UserError(`Duration must be between 1m and ${formatDuration(s.max_duration_ms)}.`);
-    if (!Number.isInteger(intervalSec) || intervalSec < MIN_INTERVAL || intervalSec > MAX_INTERVAL) throw new UserError(`Interval must be ${MIN_INTERVAL}-${MAX_INTERVAL} seconds.`);
+    if (!Number.isFinite(intervalSec) || intervalSec < MIN_INTERVAL || intervalSec > MAX_INTERVAL) throw new UserError(`Interval must be ${MIN_INTERVAL}-${MAX_INTERVAL} seconds.`);
     if (targetUserId === client.user.id) throw new UserError('I cannot fly myself.');
     if (targetUserId === guild.ownerId) throw new UserError('The server owner cannot be flown.');
     if (db.getActiveFly(targetUserId)) throw new UserError('That member is already flying. Use `/fly-stop` first.');
@@ -79,7 +98,7 @@ function createFlyService({ db, client, log }) {
     const now = Date.now();
     let id;
     try {
-      id = db.insertFly({ userId: targetUserId, moderatorId, channels: channels.map((c) => c.id), intervalMs: intervalSec * 1000, startedAt: now, expiresAt: now + durationMs });
+      id = db.insertFly({ userId: targetUserId, moderatorId, channels: channels.map((c) => c.id), intervalMs: Math.round(intervalSec * 1000), startedAt: now, expiresAt: now + durationMs });
     } catch (e) {
       if (String(e.code).startsWith('SQLITE_CONSTRAINT')) throw new UserError('That member is already flying.');
       throw e;
@@ -130,15 +149,19 @@ function createFlyService({ db, client, log }) {
           continue;
         }
         const current = guild.voiceStates.cache.get(f.user_id)?.channelId ?? null;
-        if (!current) { db.scheduleFly(f.id, now + f.interval_ms); continue; }  
+        if (!current) { db.scheduleFly(f.id, now + f.interval_ms); continue; }  // not in voice: wait
         const target = nextTarget(JSON.parse(f.channels), f.next_idx, current);
         if (!target) { db.scheduleFly(f.id, now + f.interval_ms); continue; }
+
+        // Out of rate-limit budget: try again shortly instead of queueing requests.
+        if (!limiter.tryTake()) { db.scheduleFly(f.id, Date.now() + RATE_RETRY_MS); continue; }
+
         try {
           await guild.members.edit(f.user_id, { channel: target.channelId, reason: `Fly started by ${f.moderator_id}` });
           db.recordFlyMove(f.id, target.idx, Date.now() + f.interval_ms);
         } catch (err) {
-          if (err.code === 40032) { db.scheduleFly(f.id, Date.now() + f.interval_ms); continue; }  
-          if (err.code === 10007) {                                                                 
+          if (err.code === 40032) { db.scheduleFly(f.id, Date.now() + f.interval_ms); continue; }  // not connected to voice
+          if (err.code === 10007) {                                                                 // unknown member
             db.endFly(f.id, 'finished', 'The member left the server');
             await log(flyEmbed('FLY FINISHED', db.getFly(f.id), 'The member left the server.'));
             continue;
@@ -156,4 +179,4 @@ function createFlyService({ db, client, log }) {
   return { startFly, stopFly, stopAll, processDue, flyEmbed, checkChannel, liveChannels };
 }
 
-module.exports = { createFlyService, nextTarget, MIN_INTERVAL, MAX_INTERVAL };
+module.exports = { createFlyService, createLimiter, nextTarget, MIN_INTERVAL, MAX_INTERVAL };

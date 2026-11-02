@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const { ChannelType } = require('discord.js');
 const { createDb } = require('../src/db');
-const { createFlyService, nextTarget } = require('../src/services/fly');
+const { createFlyService, createLimiter, nextTarget } = require('../src/services/fly');
 const { UserError, AccessError } = require('../src/errors');
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -54,7 +54,7 @@ test('overrides for interval and duration work, and bad values are refused', asy
   const f = await w.start({ intervalSec: 7, durationMs: 120000 });
   assert.strictEqual(f.interval_ms, 7000);
   const w2 = world();
-  await assert.rejects(() => w2.start({ intervalSec: 1 }), UserError);
+  await assert.rejects(() => w2.start({ intervalSec: 0.5 }), UserError);
   await assert.rejects(() => w2.start({ durationMs: 30 * 24 * 3600 * 1000 }), UserError);
 });
 
@@ -135,18 +135,32 @@ test('a fly finishes when its time is up, and survives a restart (saved in the d
   assert.strictEqual(w2.db.dueFly(Date.now() + 1000).length, 1); // a restarted bot finds it again
 });
 
-test('the default pace is 2 seconds, and 2 is the shortest allowed', async () => {
+test('the default pace comes from the saved default, and 0.7 is the shortest allowed', async () => {
   const w = world();
-  assert.strictEqual(w.db.getSettings().default_interval_seconds, 2);
-  const f = await w.start();                       // no override: uses the default
-  assert.strictEqual(f.interval_ms, 2000);
+  const def = w.db.getSettings().default_interval_seconds;
+  const f = await w.start();
+  assert.strictEqual(f.interval_ms, def * 1000);
   const w2 = world();
-  assert.strictEqual((await w2.start({ intervalSec: 2 })).interval_ms, 2000);
-  await assert.rejects(() => world().start({ intervalSec: 1 }), /2-300/);
+  assert.strictEqual((await w2.start({ intervalSec: 0.7 })).interval_ms, 700);
+  await assert.rejects(() => world().start({ intervalSec: 0.5 }), /0\.7-300/);
 });
 
-test('a 2-second fly really moves about every 2 seconds (timing check)', async () => {
-  const w = world(); w.add({ intervalMs: 200 });   // same logic, 10x faster so the test is quick
+test('the rate limiter allows the capacity, blocks the rest, then recovers', () => {
+  const l = createLimiter(3, 1000);
+  assert.ok(l.tryTake(0) && l.tryTake(10) && l.tryTake(20));
+  assert.strictEqual(l.tryTake(30), false);
+  assert.strictEqual(l.tryTake(1000), true);   // the first stamp (t=0) has expired
+  assert.strictEqual(l.tryTake(1001), false);
+});
+
+test('the engine stops moving once the rate budget is used up', async () => {
+  const w = world(); w.add({ intervalMs: 1 });
+  for (let i = 0; i < 20; i++) { await w.fly.processDue(); await wait(5); }
+  assert.ok(w.moves.length <= 9, `moves: ${w.moves.length}`);
+});
+
+test('a 200ms fly really moves about every 200ms (timing check)', async () => {
+  const w = world(); w.add({ intervalMs: 200 });
   const t0 = Date.now();
   for (let i = 0; i < 12; i++) { await w.fly.processDue(); await wait(50); }
   const elapsed = Date.now() - t0;

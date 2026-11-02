@@ -8,7 +8,7 @@ module.exports = {
     .setDefaultMemberPermissions(0).setDMPermission(false)
     .addUserOption((o) => o.setName('member').setDescription('memb').setRequired(true))
     .addStringOption((o) => o.setName('duration').setDescription('How long:'))
-    .addIntegerOption((o) => o.setName('interval_seconds').setDescription('interval btw')
+    .addNumberOption((o) => o.setName('interval_seconds').setDescription('interval btw')
       .setMinValue(MIN_INTERVAL).setMaxValue(MAX_INTERVAL)),
 
   async execute(interaction, ctx) {
@@ -19,7 +19,7 @@ module.exports = {
     const fly = await ctx.fly.startFly({
       guild: interaction.guild, moderatorId: interaction.user.id,
       targetUserId: interaction.options.getUser('member', true).id,
-      durationMs, intervalSec: interaction.options.getInteger('interval_seconds') ?? undefined,
+      durationMs, intervalSec: interaction.options.getNumber('interval_seconds') ?? undefined,
     });
     let note = 'ℹ️ Moves only happen while the member is in a voice channel.';
     try {
